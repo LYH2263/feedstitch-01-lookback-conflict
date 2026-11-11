@@ -19,7 +19,7 @@ async function saveLookback(row) {
     await patchJSON(`/api/sources/${row.source_id}/lookback`, {
       lookback_seconds: Number(row.lookback_seconds) || 0,
     })
-    msg.value = `已写入源 ${row.source_id} 的 lookback_seconds（底座 ingest 暂忽略此字段，留给 0-1）`
+    msg.value = `已写入源 ${row.source_id} 的 lookback_seconds：增量跑将回看 [watermark - ${row.lookback_seconds}s, watermark]`
     await refresh()
   } catch (e) {
     err.value = String(e.message || e)
@@ -43,7 +43,11 @@ onMounted(async () => {
 <template>
   <div class="page">
     <h1>水位线与设置</h1>
-    <p class="muted">增量跑依赖每源 watermark_ts；lookback_seconds 字段已预留。</p>
+    <p class="muted">
+      增量跑只接受 event_ts 严格大于 watermark 的记录；迟到记录若落在
+      [watermark - lookback_seconds, watermark] 且 revision 更高，可回看补写。
+      全量跑会先重置该源水位线再重放夹具。
+    </p>
     <p v-if="err" class="tag danger">{{ err }}</p>
     <p v-if="msg" class="tag ok">{{ msg }}</p>
     <div class="panel">

@@ -1,1 +1,1 @@
-# 0-1 stub: late-arriving events within lookback_seconds may upsert by higher revision
+# Implemented in app/services/ingest_service.py: late events inside lookback_seconds may upsert when their revision is newer.

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from app.config import FIXTURES_DIR
 from app.db import connect
-from app.engines.merge_rules import decide_merge, eligible_for_incremental
+from app.engines.merge_rules import (
+    CONFLICT_DISPOSITIONS,
+    SKIP_DISPOSITIONS,
+    UPSERT_DISPOSITIONS,
+    _is_after,
+    decide_merge,
+    within_lookback_window,
+)
 from app.engines.parse_feed import parse_fixture
 from app.repositories import canonical as canon_repo
 from app.repositories import runs as runs_repo
@@ -29,6 +35,32 @@ def preview_source(source_id: int) -> dict[str, Any]:
         conn.close()
 
 
+def _existing_view(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not existing:
+        return None
+    return {
+        "business_key": existing["business_key"],
+        "title": existing["title"],
+        "price": existing["price"],
+        "category": existing["category"],
+        "event_ts": existing["event_ts"],
+        "source_revision": existing["source_revision"],
+        "payload": existing["payload"],
+    }
+
+
+def _disposition_summary(conn, run_id: int) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT disposition, COUNT(*) AS c
+        FROM staging_rows WHERE run_id = ?
+        GROUP BY disposition
+        """,
+        (run_id,),
+    ).fetchall()
+    return {r["disposition"]: int(r["c"]) for r in rows}
+
+
 def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
     if mode not in ("incremental", "full"):
         raise ValueError("mode must be incremental or full")
@@ -42,9 +74,12 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
             raise ValueError("source disabled")
 
         if mode == "full":
+            # A full rebuild restarts the source from scratch; every fixture
+            # row is replayed through the same merge rules below.
             sources_repo.set_watermark(conn, source_id, None)
             source["watermark_ts"] = None
 
+        lookback_seconds = int(source.get("lookback_seconds") or 0)
         run_id = runs_repo.create_run(conn, source_id, mode)
         path = FIXTURES_DIR / source["fixture_path"]
 
@@ -64,56 +99,58 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
             conn.commit()
             raise
 
-        parsed = 0
-        upserted = 0
-        conflicts = 0
-        skipped = 0
         max_event_ts: str | None = source.get("watermark_ts")
-        dispositions: list[str] = []
+        lookback_candidates = 0
 
         for item in items:
-            parsed += 1
-            if mode == "incremental" and not eligible_for_incremental(
-                item["event_ts"],
-                source.get("watermark_ts"),
-                int(source.get("lookback_seconds") or 0),
-            ):
-                runs_repo.insert_staging(
-                    conn,
-                    run_id=run_id,
-                    source_id=source_id,
-                    item=item,
-                    disposition="skipped_watermark",
-                )
-                skipped += 1
-                dispositions.append("skipped_watermark")
-                continue
+            watermark_ts = source.get("watermark_ts")
+            is_late = bool(watermark_ts) and not _is_after(
+                item["event_ts"], watermark_ts
+            )
 
             existing = canon_repo.get_by_key(conn, item["business_key"])
-            existing_view = None
-            if existing:
-                existing_view = {
-                    "business_key": existing["business_key"],
-                    "title": existing["title"],
-                    "price": existing["price"],
-                    "category": existing["category"],
-                    "event_ts": existing["event_ts"],
-                    "source_revision": existing["source_revision"],
-                    "payload": existing["payload"],
-                }
+            existing_view = _existing_view(existing)
 
+            if is_late:
+                # Late record: only the lookback window may rescue it, and
+                # only when canonical already holds the key at a lower
+                # revision.  A late event for a never-seen key is left for
+                # a full replay (or a future in-order event).
+                in_window = within_lookback_window(
+                    item["event_ts"], watermark_ts, lookback_seconds
+                )
+                newer_revision = existing_view is not None and (
+                    int(item["source_revision"])
+                    > int(existing_view["source_revision"])
+                )
+                if not in_window or not newer_revision:
+                    disposition = "skip_stale" if in_window else "skipped_watermark"
+                    runs_repo.insert_staging(
+                        conn,
+                        run_id=run_id,
+                        source_id=source_id,
+                        item=item,
+                        disposition=disposition,
+                    )
+                    # Late rows never advance the watermark; it is already
+                    # at or beyond their event_ts.
+                    continue
+                lookback_candidates += 1
             decision = decide_merge(existing_view, item)
+
             if decision in ("insert", "upsert"):
                 canon_repo.upsert_item(conn, item, source_id)
+                if is_late:
+                    disposition = f"lookback_{decision}"
+                else:
+                    disposition = decision
                 runs_repo.insert_staging(
                     conn,
                     run_id=run_id,
                     source_id=source_id,
                     item=item,
-                    disposition=decision,
+                    disposition=disposition,
                 )
-                upserted += 1
-                dispositions.append(decision)
                 if max_event_ts is None or item["event_ts"] > max_event_ts:
                     max_event_ts = item["event_ts"]
             elif decision == "conflict":
@@ -126,6 +163,8 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     incoming_payload=item["payload"],
                     reason="non_key_field_mismatch",
                 )
+                # Quarantined rows are recorded for the run but are never
+                # written to canonical.
                 runs_repo.insert_staging(
                     conn,
                     run_id=run_id,
@@ -133,8 +172,6 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition="quarantine",
                 )
-                conflicts += 1
-                dispositions.append("quarantine")
                 if max_event_ts is None or item["event_ts"] > max_event_ts:
                     max_event_ts = item["event_ts"]
             else:
@@ -145,34 +182,58 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition="skip_stale",
                 )
-                skipped += 1
-                dispositions.append("skip_stale")
                 if max_event_ts is None or item["event_ts"] > max_event_ts:
                     max_event_ts = item["event_ts"]
 
         if max_event_ts:
             sources_repo.set_watermark(conn, source_id, max_event_ts)
 
+        # Counts are derived from the staging rows of this run so that the
+        # run report and the Staging page can never drift apart.
+        disposition_counts = _disposition_summary(conn, run_id)
+        parsed_count = sum(disposition_counts.values())
+        upserted_count = sum(
+            c for d, c in disposition_counts.items() if d in UPSERT_DISPOSITIONS
+        )
+        conflict_count = sum(
+            c for d, c in disposition_counts.items() if d in CONFLICT_DISPOSITIONS
+        )
+        skipped_count = sum(
+            c for d, c in disposition_counts.items() if d in SKIP_DISPOSITIONS
+        )
+        conflict_rows_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM conflicts WHERE run_id = ?", (run_id,)
+            ).fetchone()["c"]
+        )
         canonical_count = canon_repo.count_items(conn)
+
         report = {
             "source_id": source_id,
             "mode": mode,
-            "parsed_count": parsed,
-            "upserted_count": upserted,
-            "conflict_count": conflicts,
-            "skipped_count": skipped,
+            "lookback_seconds": lookback_seconds,
+            "parsed_count": parsed_count,
+            "upserted_count": upserted_count,
+            "conflict_count": conflict_count,
+            "skipped_count": skipped_count,
             "canonical_count": canonical_count,
             "watermark_ts": max_event_ts,
-            "dispositions": dispositions,
+            "lookback_candidate_count": lookback_candidates,
+            "lookback_upserted_count": sum(
+                c for d, c in disposition_counts.items()
+                if d in ("lookback_insert", "lookback_upsert")
+            ),
+            "conflict_rows_count": conflict_rows_count,
+            "disposition_counts": disposition_counts,
         }
         runs_repo.finish_run(
             conn,
             run_id,
             status="ok",
-            parsed=parsed,
-            upserted=upserted,
-            conflicts=conflicts,
-            skipped=skipped,
+            parsed=parsed_count,
+            upserted=upserted_count,
+            conflicts=conflict_count,
+            skipped=skipped_count,
             report=report,
         )
         conn.commit()

@@ -166,14 +166,26 @@ def insert_conflict(
     )
 
 
-def list_conflicts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT id, run_id, source_id, business_key, existing_payload, incoming_payload,
-               reason, created_at
-        FROM conflicts ORDER BY id DESC
-        """
-    ).fetchall()
+def list_conflicts(
+    conn: sqlite3.Connection, run_id: int | None = None
+) -> list[dict[str, Any]]:
+    if run_id is None:
+        rows = conn.execute(
+            """
+            SELECT id, run_id, source_id, business_key, existing_payload,
+                   incoming_payload, reason, created_at
+            FROM conflicts ORDER BY id DESC
+            """
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, run_id, source_id, business_key, existing_payload,
+                   incoming_payload, reason, created_at
+            FROM conflicts WHERE run_id = ? ORDER BY id
+            """,
+            (run_id,),
+        ).fetchall()
     out = []
     for r in rows:
         d = dict(r)

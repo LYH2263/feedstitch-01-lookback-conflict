@@ -41,7 +41,7 @@ def preview(source_id: int):
 
 @router.patch("/sources/{source_id}/lookback")
 def patch_lookback(source_id: int, body: LookbackUpdate):
-    """Field exists for 0-1; base ingest currently ignores lookback_seconds."""
+    """Configure the per-source lookback window used by incremental runs."""
     conn = connect()
     try:
         if not sources_repo.get_source(conn, source_id):

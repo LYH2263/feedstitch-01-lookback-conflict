@@ -66,7 +66,32 @@ onMounted(async () => {
         conflict {{ last.conflict_count }} /
         skipped {{ last.skipped_count }}
       </p>
-      <p class="mono muted">canonical_count={{ last.report?.canonical_count }} watermark={{ last.report?.watermark_ts }}</p>
+      <p class="mono muted">
+        canonical_count={{ last.report?.canonical_count }}
+        watermark={{ last.report?.watermark_ts }}
+        lookback={{ last.report?.lookback_seconds }}s
+        lookback_candidates={{ last.report?.lookback_candidate_count }}
+        lookback_upserted={{ last.report?.lookback_upserted_count }}
+      </p>
+      <p v-if="last.report?.disposition_counts">
+        <span
+          v-for="(n, d) in last.report.disposition_counts"
+          :key="d"
+          class="tag info"
+          style="margin-right:0.4rem"
+        >{{ d }} {{ n }}</span>
+      </p>
+      <p class="muted">
+        报告数字由本次 Run 的 staging disposition 统计直接汇总：
+        upserted = insert/upsert/lookback_*，conflict = quarantine，skipped = skip_*。
+      </p>
+      <p>
+        <router-link :to="{ path: '/staging', query: { run_id: last.id } }">查看本次 Staging →</router-link>
+        <span class="muted"> · </span>
+        <router-link :to="{ path: '/conflicts', query: { run_id: last.id } }">查看本次冲突 →</router-link>
+        <span class="muted"> · </span>
+        <router-link :to="{ path: '/canonical' }">Canonical（{{ last.report?.canonical_count }} 条）→</router-link>
+      </p>
     </div>
     <div class="panel">
       <h3>历史 Runs</h3>

@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 
 from app.config import FIXTURES_DIR
-from app.engines.merge_rules import decide_merge, eligible_for_incremental, fields_conflict
+from app.engines.merge_rules import (
+    decide_merge,
+    eligible_for_incremental,
+    fields_conflict,
+    within_lookback_window,
+)
 from app.engines.parse_feed import parse_fixture
 
 
@@ -75,6 +80,66 @@ def test_watermark_gate():
     assert eligible_for_incremental("2026-11-02T00:00:00Z", "2026-11-01T00:00:00Z") is True
     assert eligible_for_incremental("2026-11-01T00:00:00Z", "2026-11-01T00:00:00Z") is False
     assert eligible_for_incremental("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z") is False
+
+
+def test_lookback_window_boundaries():
+    wm = "2026-11-01T12:00:00Z"
+    assert within_lookback_window("2026-11-01T11:30:00Z", wm, 1800) is True
+    assert within_lookback_window("2026-11-01T10:00:00Z", wm, 1800) is False
+    assert within_lookback_window("2026-11-01T12:05:00Z", wm, 1800) is False
+    # lookback 0 disables the window entirely
+    assert within_lookback_window(wm, wm, 0) is False
+
+
+def test_lookback_only_rescues_newer_revision():
+    wm = "2026-11-01T12:00:00Z"
+    late = "2026-11-01T11:30:00Z"
+    old = "2026-11-01T09:00:00Z"
+
+    # late, in window, higher revision -> eligible (lookback backfill)
+    assert eligible_for_incremental(
+        late, wm, 3600, existing_revision=2, incoming_revision=3
+    ) is True
+    # late, in window, same/lower revision -> remains stale
+    assert eligible_for_incremental(
+        late, wm, 3600, existing_revision=3, incoming_revision=3
+    ) is False
+    assert eligible_for_incremental(
+        late, wm, 3600, existing_revision=4, incoming_revision=3
+    ) is False
+    # late, in window, but nothing exists in canonical -> not an upsert
+    assert eligible_for_incremental(
+        late, wm, 3600, existing_revision=None, incoming_revision=3
+    ) is False
+    # late outside the window -> skipped regardless of revision
+    assert eligible_for_incremental(
+        old, wm, 3600, existing_revision=1, incoming_revision=9
+    ) is False
+    # neither watermark nor revision gate can be applied without an watermark
+    assert eligible_for_incremental(old, None, 0) is True
+
+
+def test_lookback_conflict_still_wins_over_upsert():
+    existing = {
+        "business_key": "SKU-1",
+        "title": "X",
+        "price": 10.0,
+        "category": "c",
+        "source_revision": 2,
+        "event_ts": "t1",
+        "payload": {},
+    }
+    incoming = {
+        "business_key": "SKU-1",
+        "title": "X",
+        "price": 9.0,
+        "category": "c",
+        "source_revision": 3,
+        "event_ts": "t0",
+        "payload": {},
+    }
+    assert decide_merge(existing, incoming) == "conflict"
+
 
 
 def test_parse_missing_field_raises(tmp_path: Path):
